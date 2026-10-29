@@ -18,6 +18,7 @@ Env vars:
 """
 import base64
 import html
+import json
 import os
 import secrets
 import sqlite3
@@ -33,12 +34,12 @@ BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
 PORT = int(os.environ.get("PORT", "8000"))
 DB_PATH = os.environ.get("DB_PATH", "tracker.db")
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Asia/Amman"))
-SELF_OPEN_GRACE_SECONDS = 15  # opens this soon after creation are ignored (your own preview)
+SELF_OPEN_GRACE_SECONDS = 30  # opens this soon after sending are ignored (your own preview)
 
-# Mail-provider image proxies / scanners: they fetch images automatically,
-# so an "open" from them does not prove a human read the message.
-PROXY_MARKERS = ("googleimageproxy", "yahoomailproxy", "outlook-ios", "proofpoint",
-                 "mimecast", "barracuda", "bot", "scanner", "preview")
+# Security scanners / bots that pre-fetch images, so a hit from them does not
+# prove a human read the message. NOTE: Gmail's and Yahoo's image proxies are
+# deliberately NOT listed: they only fetch the image when the email is opened.
+PROXY_MARKERS = ("proofpoint", "mimecast", "barracuda", "bot", "scanner", "preview")
 
 GIF = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
 
@@ -58,6 +59,9 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, email_id TEXT,
             opened_at REAL, ip TEXT, user_agent TEXT, automated INTEGER);
         """)
+        cols = [r["name"] for r in c.execute("PRAGMA table_info(emails)")]
+        if "sent_at" not in cols:
+            c.execute("ALTER TABLE emails ADD COLUMN sent_at REAL")
 
 
 def fmt(ts):
@@ -95,7 +99,10 @@ def badge(s):
 
 def page_dashboard():
     with db() as c:
-        emails = c.execute("SELECT * FROM emails ORDER BY created_at DESC").fetchall()
+        # Hide pixels created for compose windows that were never sent.
+        emails = c.execute("""SELECT * FROM emails
+                              WHERE sent_at IS NOT NULL OR id IN (SELECT email_id FROM opens)
+                              ORDER BY COALESCE(sent_at, created_at) DESC""").fetchall()
         rows = ""
         for e in emails:
             s, n, first, last = status_of(e["id"], c)
@@ -156,6 +163,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def authed(self):
         h = self.headers.get("Authorization", "")
+        if h.startswith("Bearer "):  # used by the Gmail extension
+            return secrets.compare_digest(h[7:], ADMIN_PASSWORD)
         if h.startswith("Basic "):
             try:
                 _, pw = base64.b64decode(h[6:]).decode().split(":", 1)
@@ -178,6 +187,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.pixel(path[3:-4])
         if not self.authed():
             return self.need_auth()
+        if path == "/api/ping":
+            return self.send_json({"ok": True})
         if path == "/":
             return self.send(200, page_dashboard())
         if path.startswith("/email/"):
@@ -191,15 +202,40 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.authed():
             return self.need_auth()
-        if urlparse(self.path).path != "/create":
-            return self.send(404, "Not found")
-        length = int(self.headers.get("Content-Length", 0))
-        form = parse_qs(self.rfile.read(length).decode())
-        eid = secrets.token_urlsafe(12)
-        with db() as c:
-            c.execute("INSERT INTO emails VALUES(?,?,?,?)", (
-                eid, form.get("recipient", [""])[0][:200], form.get("subject", [""])[0][:300], time.time()))
-        self.send(303, "", headers={"Location": f"/email/{eid}"})
+        path = urlparse(self.path).path
+        length = min(int(self.headers.get("Content-Length", 0)), 65536)
+        raw = self.rfile.read(length).decode("utf-8", "replace")
+        now = time.time()
+
+        if path == "/create":  # manual form on the dashboard
+            form = parse_qs(raw)
+            eid = secrets.token_urlsafe(12)
+            with db() as c:
+                c.execute("INSERT INTO emails(id,recipient,subject,created_at,sent_at) VALUES(?,?,?,?,?)", (
+                    eid, form.get("recipient", [""])[0][:200], form.get("subject", [""])[0][:300], now, now))
+            return self.send(303, "", headers={"Location": f"/email/{eid}"})
+
+        if path == "/api/new":  # extension: a compose window was opened -> get a pixel
+            eid = secrets.token_urlsafe(12)
+            with db() as c:
+                c.execute("INSERT INTO emails(id,created_at) VALUES(?,?)", (eid, now))
+            return self.send_json({"id": eid, "url": f"{BASE_URL}/t/{eid}.gif"})
+
+        if path == "/api/sent":  # extension: the compose window's Send was pressed
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                return self.send_json({"error": "bad json"}, 400)
+            with db() as c:
+                c.execute("UPDATE emails SET recipient=?, subject=?, sent_at=? WHERE id=? AND sent_at IS NULL", (
+                    str(data.get("recipient", ""))[:200], str(data.get("subject", ""))[:300], now,
+                    str(data.get("id", ""))))
+            return self.send_json({"ok": True})
+
+        self.send(404, "Not found")
+
+    def send_json(self, obj, code=200):
+        self.send(code, json.dumps(obj), "application/json")
 
     def pixel(self, email_id):
         ua = self.headers.get("User-Agent", "")
@@ -207,8 +243,9 @@ class Handler(BaseHTTPRequestHandler):
         is_me = "mt_me" in jar
         try:
             with db() as c:
-                e = c.execute("SELECT created_at FROM emails WHERE id=?", (email_id,)).fetchone()
-                if e and not is_me and time.time() - e["created_at"] > SELF_OPEN_GRACE_SECONDS:
+                e = c.execute("SELECT COALESCE(sent_at, created_at) AS ref FROM emails WHERE id=?",
+                              (email_id,)).fetchone()
+                if e and not is_me and time.time() - e["ref"] > SELF_OPEN_GRACE_SECONDS:
                     automated = int(any(m in ua.lower() for m in PROXY_MARKERS))
                     c.execute("INSERT INTO opens(email_id,opened_at,ip,user_agent,automated) VALUES(?,?,?,?,?)",
                               (email_id, time.time(), self.client_ip(), ua[:300], automated))
