@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: mailtracker
+    runtime: python
+    # Persistent disk needs a paid plan. For the free tier, set plan: free and
+    # delete the `disk:` block and the DB_PATH variable (data is then wiped on restart).
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 app.py
+    envVars:
+      - key: ADMIN_PASSWORD
+        sync: false        # Render asks you for this when you create the blueprint
+      - key: BASE_URL
+        sync: false        # e.g. https://mailtracker.onrender.com (no trailing slash)
+      - key: TZ_NAME
+        value: Asia/Amman
+      - key: DB_PATH
+        value: /data/tracker.db
+    disk:
+      name: tracker-data
+      mountPath: /data
+      sizeGB: 1
