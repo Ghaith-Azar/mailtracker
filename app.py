@@ -183,14 +183,14 @@ def page_dashboard():
 <p><small>OPENED? = only automated/proxy loads seen, so a human read is not confirmed.</small></p>"""
 
 
-def page_email(email_id):
+def page_email(email_id, base):
     with db() as c:
         e = c.execute("SELECT * FROM emails WHERE id=?", (email_id,)).fetchone()
         if not e:
             return None
         s, n, first, last = status_of(email_id, c)
         opens = c.execute("SELECT * FROM opens WHERE email_id=? ORDER BY opened_at DESC", (email_id,)).fetchall()
-    url = f"{BASE_URL}/t/{email_id}.gif"
+    url = f"{base}/t/{email_id}.gif"
     snippet = f'<img src="{url}" width="1" height="1" alt="" style="display:none">'
     log = "".join(
         f'<tr><td>{fmt(o["opened_at"])}</td><td>{"automated/proxy" if o["automated"] else "likely human"}</td>'
@@ -237,6 +237,16 @@ class Handler(BaseHTTPRequestHandler):
     def need_auth(self):
         self.send(401, "Login required", headers={"WWW-Authenticate": 'Basic realm="MailTracker"'})
 
+    def base_url(self):
+        """Public address used inside tracking pixels. Uses BASE_URL if it is a real
+        address, otherwise the address this request actually arrived on (so a forgotten
+        BASE_URL on Render can no longer produce localhost pixels)."""
+        if "localhost" not in BASE_URL and "127.0.0.1" not in BASE_URL:
+            return BASE_URL
+        host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or f"localhost:{PORT}"
+        proto = (self.headers.get("X-Forwarded-Proto") or "http").split(",")[0].strip()
+        return f"{proto}://{host}"
+
     def client_ip(self):
         xff = self.headers.get("X-Forwarded-For")
         return xff.split(",")[0].strip() if xff else self.client_address[0]
@@ -255,7 +265,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             return self.send(200, page_dashboard())
         if path.startswith("/email/"):
-            body = page_email(path.split("/")[2])
+            body = page_email(path.split("/")[2], self.base_url())
             return self.send(200, body) if body else self.send(404, "Not found")
         if path == "/ignore-me":
             return self.send(200, "Your opens in this browser will be ignored. <a href='/'>Back</a>",
@@ -292,7 +302,7 @@ class Handler(BaseHTTPRequestHandler):
             eid = secrets.token_urlsafe(12)
             with db() as c:
                 c.execute("INSERT INTO emails(id,created_at) VALUES(?,?)", (eid, now))
-            return self.send_json({"id": eid, "url": f"{BASE_URL}/t/{eid}.gif"})
+            return self.send_json({"id": eid, "url": f"{self.base_url()}/t/{eid}.gif"})
 
         if path == "/api/sent":  # extension: the compose window's Send was pressed
             try:
