@@ -8,7 +8,9 @@ services:
     envVars:
       - key: ADMIN_PASSWORD
         sync: false        # Render asks you for this
-      - key: DATABASE_URL
-        sync: false        # Neon connection string (keeps your history permanently)
+      - key: TURSO_DATABASE_URL
+        sync: false        # from: turso db show mailtracker --url
+      - key: TURSO_AUTH_TOKEN
+        sync: false        # from: turso db tokens create mailtracker
       - key: TZ_NAME
         value: Asia/Amman

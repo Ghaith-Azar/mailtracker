@@ -3,13 +3,15 @@
 MailTracker - a small self-hosted "was my email opened?" system.
 
 Storage:
-  * DATABASE_URL set  -> permanent PostgreSQL database (e.g. free Neon). Recommended.
+  * TURSO_DATABASE_URL set -> permanent Turso database (free). Recommended.
+  * DATABASE_URL set  -> permanent PostgreSQL database (e.g. free Neon).
   * DATABASE_URL unset -> local SQLite file (fine on your own PC; on free Render it is
     wiped every time the server restarts or sleeps).
 
 Env vars:
   ADMIN_PASSWORD  dashboard password
-  DATABASE_URL    postgres connection string (optional, recommended on Render)
+  TURSO_DATABASE_URL + TURSO_AUTH_TOKEN   permanent storage on Turso (recommended)
+  DATABASE_URL    or a PostgreSQL connection string (e.g. Neon)
   BASE_URL        public URL (optional; detected automatically from the request)
   PORT            default 8000
   DB_PATH         SQLite file, default tracker.db
@@ -24,6 +26,8 @@ import sqlite3
 import sys
 import time
 import traceback
+import urllib.error
+import urllib.request
 from datetime import datetime
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,6 +39,11 @@ BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
 PORT = int(os.environ.get("PORT", "8000"))
 DB_PATH = os.environ.get("DB_PATH", "tracker.db")
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+TURSO_URL = (os.environ.get("TURSO_DATABASE_URL", "").strip().replace("libsql://", "https://", 1)
+             .rstrip("/"))
+if TURSO_URL.endswith("/v2/pipeline"):
+    TURSO_URL = TURSO_URL[: -len("/v2/pipeline")]
+TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Asia/Amman"))
 SELF_OPEN_GRACE_SECONDS = 10  # requests this soon after sending are assumed to be you
 
@@ -49,20 +58,88 @@ GIF = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7
 
 
 # ----------------------------------------------------------------------------- storage
+class TursoCursor:
+    def __init__(self, names, rows):
+        self._rows = [dict(zip(names, r)) for r in rows]
+        self._i = 0
+
+    def fetchone(self):
+        if self._i < len(self._rows):
+            self._i += 1
+            return self._rows[self._i - 1]
+        return None
+
+    def fetchall(self):
+        out, self._i = self._rows[self._i:], len(self._rows)
+        return out
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+def _turso_arg(v):
+    if v is None:
+        return {"type": "null"}
+    if isinstance(v, bool):
+        return {"type": "integer", "value": str(int(v))}
+    if isinstance(v, int):
+        return {"type": "integer", "value": str(v)}
+    if isinstance(v, float):
+        return {"type": "float", "value": v}
+    return {"type": "text", "value": str(v)}
+
+
+def _turso_val(cell):
+    t, v = cell.get("type"), cell.get("value")
+    if t == "null":
+        return None
+    if t == "integer":
+        return int(v)
+    if t == "float":
+        return float(v)
+    return v  # text (blobs are not used)
+
+
+def turso_execute(sql, params=()):
+    """Run one statement against Turso over its HTTP API (no extra libraries needed)."""
+    body = {"requests": [
+        {"type": "execute", "stmt": {"sql": sql, "args": [_turso_arg(p) for p in params]}},
+        {"type": "close"}]}
+    req = urllib.request.Request(
+        TURSO_URL + "/v2/pipeline", data=json.dumps(body).encode(), method="POST",
+        headers={"Authorization": "Bearer " + TURSO_TOKEN, "Content-Type": "application/json",
+                 "User-Agent": "MailTracker/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.load(r)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Turso HTTP {e.code}: {e.read()[:300]!r}") from None
+    res = data["results"][0]
+    if res.get("type") == "error":
+        raise RuntimeError("Turso error: " + str(res.get("error", {}).get("message", res)))
+    result = res["response"]["result"]
+    names = [c["name"] for c in result.get("cols", [])]
+    return TursoCursor(names, [[_turso_val(x) for x in row] for row in result.get("rows", [])])
+
+
 class DB:
-    """Tiny wrapper so the same SQL ('?' placeholders) runs on SQLite and PostgreSQL."""
+    """Tiny wrapper so the same SQL ('?' placeholders) runs on SQLite, Turso and PostgreSQL."""
 
     def __init__(self):
-        self.pg = bool(DATABASE_URL)
+        self.kind = "turso" if TURSO_URL else ("pg" if DATABASE_URL else "sqlite")
+        self.pg = self.kind == "pg"
+        self.persistent = self.kind != "sqlite"
         if self.pg:
             import psycopg
             from psycopg.rows import dict_row
             self.c = psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=20)
-        else:
+        elif self.kind == "sqlite":
             self.c = sqlite3.connect(DB_PATH)
             self.c.row_factory = sqlite3.Row
 
     def execute(self, sql, params=()):
+        if self.kind == "turso":
+            return turso_execute(sql, params)
         if self.pg:
             sql = sql.replace("?", "%s")
         return self.c.execute(sql, params)
@@ -71,6 +148,8 @@ class DB:
         return self
 
     def __exit__(self, et, ev, tb):
+        if self.kind == "turso":  # every statement is already committed
+            return False
         try:
             self.c.rollback() if et else self.c.commit()
         finally:
@@ -95,7 +174,7 @@ def init_db():
             id {idcol}, ts DOUBLE PRECISION, email_id TEXT, ip TEXT, user_agent TEXT, result TEXT)""")
         c.execute("CREATE INDEX IF NOT EXISTS opens_email ON opens(email_id)")
         c.execute("CREATE INDEX IF NOT EXISTS hits_email ON hits(email_id)")
-        if not c.pg:  # upgrade older SQLite files
+        if c.kind == "sqlite":  # upgrade older SQLite files
             cols = [r["name"] for r in c.execute("PRAGMA table_info(emails)")]
             for col, typ in (("sent_at", "DOUBLE PRECISION"), ("pixel_present", "INTEGER")):
                 if col not in cols:
@@ -203,11 +282,11 @@ def badge(s):
 
 def health_panel(c):
     lines = []
-    if c.pg:
+    if c.persistent:
         lines.append('<span class=ok>✅ Storage: permanent database. History survives restarts.</span>')
     else:
         lines.append('<span class=warn>⚠ Storage: temporary file. On free Render all history is wiped when the '
-                     'server restarts or sleeps. Set DATABASE_URL to a free Neon database to fix this.</span>')
+                     'server restarts or sleeps. Connect a free Turso or Neon database to fix this.</span>')
     external = PING["ts"] and "render" not in PING["ua"].lower()
     if external and time.time() - PING["ts"] < 600:
         lines.append(f'<span class=ok>✅ Keep-alive: last ping {ago(PING["ts"])} '
@@ -452,8 +531,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    init_db()
+    try:
+        init_db()
+    except Exception as e:
+        print(f"\nCANNOT CONNECT TO THE DATABASE: {e}\n"
+              "Check TURSO_DATABASE_URL (should start with libsql:// or https://) and TURSO_AUTH_TOKEN "
+              "(or DATABASE_URL), with no extra spaces or quotes.", file=sys.stderr)
+        sys.exit(1)
     if ADMIN_PASSWORD == "changeme":
         print("WARNING: set ADMIN_PASSWORD before exposing this server.")
-    print(f"MailTracker on port {PORT}; storage: {'PostgreSQL' if DATABASE_URL else 'SQLite ' + DB_PATH}")
+    kind = "Turso" if TURSO_URL else ("PostgreSQL" if DATABASE_URL else "SQLite " + DB_PATH)
+    print(f"MailTracker on port {PORT}; storage: {kind}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
