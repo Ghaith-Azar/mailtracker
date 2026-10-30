@@ -92,6 +92,64 @@ small{color:#666}
 </style>"""
 
 
+def parse_client(ua):
+    """Turn a raw User-Agent into (what they read it with, extra detail). Best effort."""
+    u = (ua or "").lower()
+    if not u:
+        return "Unknown", ""
+    # Operating system
+    if "iphone" in u or "ipad" in u:
+        os_ = "iPhone/iPad"
+    elif "android" in u:
+        os_ = "Android"
+    elif "windows" in u:
+        os_ = "Windows"
+    elif "mac os x" in u or "macintosh" in u:
+        os_ = "Mac"
+    elif "cros" in u:
+        os_ = "ChromeOS"
+    elif "linux" in u:
+        os_ = "Linux"
+    else:
+        os_ = ""
+    # Mail services that load images through their own servers
+    if "googleimageproxy" in u or "ggpht.com" in u:
+        return "Gmail", "Google hides the real device and browser"
+    if "yahoomailproxy" in u or "yahoo" in u:
+        return "Yahoo Mail", "Yahoo hides the real device and browser"
+    if "microsoft outlook" in u or "microsoft office" in u or "ms-office" in u:
+        return "Outlook (desktop app)", os_
+    if "thunderbird" in u:
+        return "Thunderbird", os_
+    if any(m in u for m in ("proofpoint", "mimecast", "barracuda", "bot", "scanner", "preview")):
+        return "Security scanner", "automated, not a person"
+    # Browser
+    if "edg/" in u or "edge/" in u:
+        browser = "Edge"
+    elif "opr/" in u or "opera" in u:
+        browser = "Opera"
+    elif "firefox" in u or "fxios" in u:
+        browser = "Firefox"
+    elif "crios" in u or ("chrome" in u and "chromium" not in u):
+        browser = "Chrome"
+    elif "safari" in u and "version/" in u:
+        browser = "Safari"
+    else:
+        browser = ""
+    # Apple Mail identifies as bare WebKit: no Safari/Chrome token at all
+    if ("applewebkit" in u and "safari" not in u and "crios" not in u and "fxios" not in u
+            and os_ in ("iPhone/iPad", "Mac")):
+        return "Apple Mail", (os_ + " (Apple may pre-load images, so this can be a false open)")
+    if browser:
+        return "Web browser / webmail", f"{browser} on {os_}" if os_ else browser
+    return "Other", (ua or "")[:60]
+
+
+def client_label(ua):
+    name, detail = parse_client(ua)
+    return f'<b>{html.escape(name)}</b>' + (f'<br><small>{html.escape(detail)}</small>' if detail else "")
+
+
 def badge(s):
     cls = s.split()[0].rstrip("?")
     return f'<span class="badge {cls}">{html.escape(s)}</span>'
@@ -106,9 +164,12 @@ def page_dashboard():
         rows = ""
         for e in emails:
             s, n, first, last = status_of(e["id"], c)
+            lo = c.execute("""SELECT user_agent FROM opens WHERE email_id=?
+                              ORDER BY automated ASC, opened_at DESC LIMIT 1""", (e["id"],)).fetchone()
+            via = client_label(lo["user_agent"]) if lo else "—"
             rows += (f'<tr><td><a href="/email/{e["id"]}">{html.escape(e["subject"] or "(no subject)")}</a></td>'
                      f'<td>{html.escape(e["recipient"] or "")}</td><td>{badge(s)}</td>'
-                     f'<td>{n}</td><td>{fmt(first)}</td><td>{fmt(last)}</td></tr>')
+                     f'<td>{n}</td><td>{via}</td><td>{fmt(first)}</td><td>{fmt(last)}</td></tr>')
     return f"""<!doctype html><title>MailTracker</title>{STYLE}
 <h2>📬 MailTracker</h2>
 <div class=card><form method=post action=/create>
@@ -117,8 +178,8 @@ def page_dashboard():
 <input name=subject placeholder="Subject" required>
 <button>Create tracking pixel</button></form>
 <small><a href="/ignore-me">Ignore my own opens in this browser</a></small></div>
-<table><tr><th>Subject</th><th>To</th><th>Status</th><th>Opens</th><th>First opened</th><th>Last opened</th></tr>
-{rows or '<tr><td colspan=6>No tracked emails yet.</td></tr>'}</table>
+<table><tr><th>Subject</th><th>To</th><th>Status</th><th>Opens</th><th>Opened with</th><th>First opened</th><th>Last opened</th></tr>
+{rows or '<tr><td colspan=7>No tracked emails yet.</td></tr>'}</table>
 <p><small>OPENED? = only automated/proxy loads seen, so a human read is not confirmed.</small></p>"""
 
 
@@ -133,7 +194,7 @@ def page_email(email_id):
     snippet = f'<img src="{url}" width="1" height="1" alt="" style="display:none">'
     log = "".join(
         f'<tr><td>{fmt(o["opened_at"])}</td><td>{"automated/proxy" if o["automated"] else "likely human"}</td>'
-        f'<td>{html.escape(o["ip"] or "")}</td><td><small>{html.escape((o["user_agent"] or "")[:90])}</small></td></tr>'
+        f'<td>{client_label(o["user_agent"])}</td><td>{html.escape(o["ip"] or "")}</td></tr>'
         for o in opens)
     return f"""<!doctype html><title>Email</title>{STYLE}
 <p><a href="/">← Back</a></p>
@@ -142,7 +203,7 @@ def page_email(email_id):
 <div class=card><b>Paste this at the bottom of your email (HTML mode):</b>
 <textarea rows=3 readonly onclick="this.select()">{html.escape(snippet)}</textarea>
 <small>Or insert an image from URL: {html.escape(url)}</small></div>
-<table><tr><th>Time</th><th>Type</th><th>IP</th><th>Client</th></tr>
+<table><tr><th>Time</th><th>Type</th><th>Opened with</th><th>IP</th></tr>
 {log or '<tr><td colspan=4>No opens yet.</td></tr>'}</table>"""
 
 
@@ -183,6 +244,8 @@ class Handler(BaseHTTPRequestHandler):
     # ---- routes
     def do_GET(self):
         path = urlparse(self.path).path
+        if path == "/health":  # public, for uptime monitors / Render health check
+            return self.send(200, "ok", "text/plain")
         if path.startswith("/t/") and path.endswith(".gif"):
             return self.pixel(path[3:-4])
         if not self.authed():
@@ -198,6 +261,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, "Your opens in this browser will be ignored. <a href='/'>Back</a>",
                              headers={"Set-Cookie": "mt_me=1; Max-Age=31536000; Path=/; SameSite=Lax"})
         self.send(404, "Not found")
+
+    def do_HEAD(self):  # some uptime monitors ping with HEAD
+        if urlparse(self.path).path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
     def do_POST(self):
         if not self.authed():
