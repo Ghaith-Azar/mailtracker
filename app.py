@@ -19,6 +19,7 @@ Env vars:
 """
 import base64
 import html
+import ipaddress
 import json
 import os
 import secrets
@@ -44,6 +45,8 @@ TURSO_URL = (os.environ.get("TURSO_DATABASE_URL", "").strip().replace("libsql://
 if TURSO_URL.endswith("/v2/pipeline"):
     TURSO_URL = TURSO_URL[: -len("/v2/pipeline")]
 TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
+GEO_URL = os.environ.get("GEO_URL", "https://ipwho.is/{ip}")  # free, no key, HTTPS
+GEO_CACHE = {}  # ip -> (expires_at, result)
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Asia/Amman"))
 SELF_OPEN_GRACE_SECONDS = 10  # requests this soon after sending are assumed to be you
 
@@ -169,16 +172,27 @@ def init_db():
             created_at DOUBLE PRECISION, sent_at DOUBLE PRECISION, pixel_present INTEGER)""")
         c.execute(f"""CREATE TABLE IF NOT EXISTS opens(
             id {idcol}, email_id TEXT, opened_at DOUBLE PRECISION,
-            ip TEXT, user_agent TEXT, automated INTEGER)""")
+            ip TEXT, user_agent TEXT, automated INTEGER,
+            country TEXT, country_code TEXT, region TEXT, city TEXT, isp TEXT)""")
         c.execute(f"""CREATE TABLE IF NOT EXISTS hits(
             id {idcol}, ts DOUBLE PRECISION, email_id TEXT, ip TEXT, user_agent TEXT, result TEXT)""")
         c.execute("CREATE INDEX IF NOT EXISTS opens_email ON opens(email_id)")
         c.execute("CREATE INDEX IF NOT EXISTS hits_email ON hits(email_id)")
-        if c.kind == "sqlite":  # upgrade older SQLite files
-            cols = [r["name"] for r in c.execute("PRAGMA table_info(emails)")]
-            for col, typ in (("sent_at", "DOUBLE PRECISION"), ("pixel_present", "INTEGER")):
-                if col not in cols:
-                    c.execute(f"ALTER TABLE emails ADD COLUMN {col} {typ}")
+        # Upgrade databases created by older versions.
+        for table, col, typ in (("emails", "sent_at", "DOUBLE PRECISION"), ("emails", "pixel_present", "INTEGER"),
+                                ("opens", "country", "TEXT"), ("opens", "country_code", "TEXT"),
+                                ("opens", "region", "TEXT"), ("opens", "city", "TEXT"), ("opens", "isp", "TEXT")):
+            if c.pg:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {typ}")
+            else:
+                try:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+                except Exception as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+        # Forget compose windows that were opened but never sent (older than a week).
+        c.execute("""DELETE FROM emails WHERE sent_at IS NULL AND created_at < ?
+                     AND id NOT IN (SELECT email_id FROM opens)""", (time.time() - 7 * 86400,))
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -260,6 +274,62 @@ def client_label(ua):
     return f"<b>{html.escape(name)}</b>" + (f"<br><small>{html.escape(detail)}</small>" if detail else "")
 
 
+def geolocate(ip):
+    """Approximate location of an IP via a free service. Returns a dict or None."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    if not addr.is_global:
+        return None
+    hit = GEO_CACHE.get(ip)
+    if hit and hit[0] > time.time():
+        return hit[1]
+    result, ttl = None, 60  # failures are retried after a minute
+    try:
+        req = urllib.request.Request(GEO_URL.format(ip=ip), headers={"User-Agent": "MailTracker/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            d = json.load(r)
+        if d.get("success", True) and d.get("country"):
+            conn = d.get("connection") or {}
+            result = {"country": d.get("country"), "country_code": d.get("country_code"),
+                      "region": d.get("region"), "city": d.get("city"),
+                      "isp": conn.get("isp") or conn.get("org") or d.get("isp")}
+            ttl = 86400
+    except Exception:
+        pass
+    if len(GEO_CACHE) > 5000:
+        GEO_CACHE.clear()
+    GEO_CACHE[ip] = (time.time() + ttl, result)
+    return result
+
+
+PROVIDER_WORDS = ("google", "apple", "microsoft", "yahoo", "cloudflare", "amazon", "proofpoint", "mimecast")
+
+
+def flag(cc):
+    cc = (cc or "").upper()
+    return "".join(chr(0x1F1E6 + ord(ch) - 65) for ch in cc) if len(cc) == 2 and cc.isalpha() else ""
+
+
+def location_label(o):
+    """Country/city + IP for one logged open, with a warning when it is a mail provider's server."""
+    ip = o["ip"] or ""
+    if o["country"]:
+        place = ", ".join(x for x in (o["city"], o["region"], o["country"]) if x)
+        out = f'{flag(o["country_code"])} {html.escape(place)}'
+        isp = o["isp"] or ""
+        if isp:
+            out += f"<br><small>{html.escape(isp)}</small>"
+        proxied = (parse_client(o["user_agent"])[0] in ("Gmail", "Yahoo Mail", "Apple Mail")
+                   or any(w in isp.lower() for w in PROVIDER_WORDS))
+        if proxied:
+            out += "<br><small class=warn>Mail provider's server, not the reader's real location</small>"
+    else:
+        out = "<small>location unavailable</small>"
+    return out + f"<br><small>IP {html.escape(ip)}</small>"
+
+
 STYLE = """
 <meta name=viewport content="width=device-width,initial-scale=1">
 <style>
@@ -271,7 +341,7 @@ input,button{padding:8px;font-size:14px}input{width:100%;box-sizing:border-box;m
 button{cursor:pointer}textarea{width:100%;box-sizing:border-box;font-size:12px}
 .card{border:1px solid #ddd;border-radius:8px;padding:12px;margin:12px 0}
 .ok{color:#116b2b}.warn{color:#a15c00;font-weight:600}.bad{color:#b00020;font-weight:600}
-small{color:#666}
+small{color:#666}.danger{color:#b00020}
 </style>"""
 
 
@@ -302,6 +372,11 @@ def health_panel(c):
     return '<div class=card>' + "<br>".join(lines) + "</div>"
 
 
+CONFIRM_JS = ("var n=document.querySelectorAll('input[name=id]:checked').length;"
+              "if(!n){alert('Tick at least one email first.');return false}"
+              "return confirm('Permanently delete '+n+' email(s) and their open history?')")
+
+
 def page_dashboard():
     with db() as c:
         emails = c.execute("""SELECT * FROM emails
@@ -320,14 +395,19 @@ def page_dashboard():
         s, n, first, last = status_from(opens)
         pick = ([o for o in reversed(opens) if not o["automated"]] or list(reversed(opens)) or [None])[0]
         via = client_label(pick["user_agent"]) if pick else "—"
+        where = location_label(pick) if pick else "—"
         warn = "<br><small class=bad>⚠ tracking pixel was missing when sent</small>" if e["pixel_present"] == 0 else ""
-        rows += (f'<tr><td><a href="/email/{e["id"]}">{html.escape(e["subject"] or "(no subject)")}</a>{warn}</td>'
+        rows += (f'<tr><td><input type=checkbox name=id value="{e["id"]}"></td>'
+                 f'<td><a href="/email/{e["id"]}">{html.escape(e["subject"] or "(no subject)")}</a>{warn}</td>'
                  f'<td>{html.escape(e["recipient"] or "")}</td><td>{badge(s)}</td>'
-                 f'<td>{n}</td><td>{via}</td><td>{fmt(first)}</td><td>{fmt(last)}</td></tr>')
+                 f'<td>{n}</td><td>{via}</td><td>{where}</td><td>{fmt(first)}</td><td>{fmt(last)}</td></tr>')
     return f"""<!doctype html><title>MailTracker</title>{STYLE}
 <h2>📬 MailTracker</h2>{panel}
-<table><tr><th>Subject</th><th>To</th><th>Status</th><th>Opens</th><th>Opened with</th><th>First opened</th><th>Last opened</th></tr>
-{rows or '<tr><td colspan=7>No tracked emails yet.</td></tr>'}</table>
+<form method=post action=/delete onsubmit="{CONFIRM_JS}">
+<p><button class=danger>🗑 Delete selected</button> <small>Tick the boxes (top box selects all).</small></p>
+<table><tr><th><input type=checkbox title="Select all" onclick="document.querySelectorAll('input[name=id]').forEach(b=>b.checked=this.checked)"></th>
+<th>Subject</th><th>To</th><th>Status</th><th>Opens</th><th>Opened with</th><th>Location</th><th>First opened</th><th>Last opened</th></tr>
+{rows or '<tr><td colspan=9>No tracked emails yet.</td></tr>'}</table></form>
 <p><small>OPENED? = only automated/scanner loads seen, so a human read is not confirmed.
 Opens in the first {SELF_OPEN_GRACE_SECONDS}s after sending are assumed to be you.
 <a href="/ignore-me">Ignore my own opens in this browser</a></small></p>
@@ -348,16 +428,19 @@ def page_email(email_id, base):
     snippet = f'<img src="{url}" width="1" height="1" alt="" style="display:none">'
     log = "".join(
         f'<tr><td>{fmt(o["opened_at"])}</td><td>{"automated/scanner" if o["automated"] else "likely human"}</td>'
-        f'<td>{client_label(o["user_agent"])}</td><td>{html.escape(o["ip"] or "")}</td></tr>' for o in opens)
+        f'<td>{client_label(o["user_agent"])}</td><td>{location_label(o)}</td></tr>' for o in opens)
     raw = "".join(
-        f'<tr><td>{fmt(h["ts"])}</td><td>{html.escape(h["result"])}</td><td>{client_label(h["user_agent"])}</td></tr>'
+        f'<tr><td>{fmt(h["ts"])}</td><td>{html.escape(h["result"])}</td><td>{client_label(h["user_agent"])}'
+        f'<br><small>IP {html.escape(h["ip"] or "")}</small></td></tr>'
         for h in hits)
     warn = "<p class=bad>⚠ The tracking pixel was missing from this email when it was sent.</p>" if e["pixel_present"] == 0 else ""
     return f"""<!doctype html><title>Email</title>{STYLE}
 <p><a href="/">← Back</a></p>
+<form method=post action=/delete style="float:right" onsubmit="return confirm('Permanently delete this email and its open history?')">
+<input type=hidden name=id value="{html.escape(email_id)}"><button class=danger>🗑 Delete this email</button></form>
 <h3>{html.escape(e["subject"] or "(no subject)")}</h3>
 <p>To: {html.escape(e["recipient"] or "")} &nbsp; {badge(s)} &nbsp; Opens: {n}</p>{warn}
-<table><tr><th>Time</th><th>Type</th><th>Opened with</th><th>IP</th></tr>
+<table><tr><th>Time</th><th>Type</th><th>Opened with</th><th>Location / IP</th></tr>
 {log or '<tr><td colspan=4>No opens yet.</td></tr>'}</table>
 <h4>Every request the server received for this email's pixel</h4>
 <table><tr><th>Time</th><th>What happened</th><th>From</th></tr>
@@ -464,6 +547,13 @@ class Handler(BaseHTTPRequestHandler):
                              headers={"Set-Cookie": "mt_me=1; Max-Age=31536000; Path=/; SameSite=Lax"})
         self.send(404, "Not found")
 
+    def same_site(self):
+        """Browsers resend saved passwords on cross-site form posts, so only accept deletes
+        that really come from a page on this server."""
+        src = self.headers.get("Origin") or self.headers.get("Referer") or ""
+        hosts = {self.headers.get("Host"), self.headers.get("X-Forwarded-Host")} - {None}
+        return bool(src) and urlparse(src).netloc in hosts
+
     def do_POST(self):
         if not self.authed():
             return self.need_auth()
@@ -479,6 +569,18 @@ class Handler(BaseHTTPRequestHandler):
                 c.execute("INSERT INTO emails(id,recipient,subject,created_at,sent_at) VALUES(?,?,?,?,?)", (
                     eid, form.get("recipient", [""])[0][:200], form.get("subject", [""])[0][:300], now, now))
             return self.send(303, "", headers={"Location": f"/email/{eid}"})
+
+        if path == "/delete":
+            if not self.same_site():
+                return self.send(403, "Blocked: this request did not come from the MailTracker page.")
+            ids = [i[:60] for i in parse_qs(raw).get("id", [])][:500]
+            if ids:
+                q = ",".join("?" * len(ids))
+                with db() as c:
+                    c.execute(f"DELETE FROM opens WHERE email_id IN ({q})", ids)
+                    c.execute(f"DELETE FROM hits WHERE email_id IN ({q})", ids)
+                    c.execute(f"DELETE FROM emails WHERE id IN ({q})", ids)
+            return self.send(303, "", headers={"Location": "/"})
 
         if path == "/api/new":  # extension: compose window opened -> hand out a pixel
             eid = secrets.token_urlsafe(12)
@@ -504,7 +606,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def pixel(self, email_id):
         ua = self.headers.get("User-Agent", "")
+        ip = self.client_ip()
         is_me = "mt_me" in cookies.SimpleCookie(self.headers.get("Cookie", ""))
+        # Answer immediately so the recipient's mail app never waits on our database.
+        self.send(200, GIF, "image/gif", {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                                          "Pragma": "no-cache", "Expires": "0"})
         try:
             with db() as c:
                 now = time.time()
@@ -519,15 +625,16 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     result = "counted as an open"
                     automated = int(any(m in ua.lower() for m in PROXY_MARKERS))
-                    c.execute("INSERT INTO opens(email_id,opened_at,ip,user_agent,automated) VALUES(?,?,?,?,?)",
-                              (email_id, now, self.client_ip(), ua[:300], automated))
+                    g = geolocate(ip) or {}
+                    c.execute("""INSERT INTO opens(email_id,opened_at,ip,user_agent,automated,
+                                 country,country_code,region,city,isp) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                              (email_id, now, ip, ua[:300], automated, g.get("country"), g.get("country_code"),
+                               g.get("region"), g.get("city"), g.get("isp")))
                 c.execute("INSERT INTO hits(ts,email_id,ip,user_agent,result) VALUES(?,?,?,?,?)",
-                          (now, email_id, self.client_ip(), ua[:300], result))
+                          (now, email_id, ip, ua[:300], result))
                 c.execute("DELETE FROM hits WHERE id < (SELECT MAX(id) FROM hits) - 500")
         except Exception:
-            traceback.print_exc(file=sys.stderr)  # never break the image response
-        self.send(200, GIF, "image/gif", {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-                                          "Pragma": "no-cache", "Expires": "0"})
+            traceback.print_exc(file=sys.stderr)
 
 
 if __name__ == "__main__":
