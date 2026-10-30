@@ -3,13 +3,12 @@ services:
     name: mailtracker
     runtime: python
     plan: free
-    healthCheckPath: /health
     buildCommand: pip install -r requirements.txt
     startCommand: python3 app.py
     envVars:
       - key: ADMIN_PASSWORD
-        sync: false        # Render asks you for this when you create the blueprint
-      - key: BASE_URL
-        sync: false        # e.g. https://mailtracker.onrender.com (no trailing slash)
+        sync: false        # Render asks you for this
+      - key: DATABASE_URL
+        sync: false        # Neon connection string (keeps your history permanently)
       - key: TZ_NAME
         value: Asia/Amman
