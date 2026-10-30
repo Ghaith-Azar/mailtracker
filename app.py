@@ -48,14 +48,24 @@ TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
 GEO_URL = os.environ.get("GEO_URL", "https://ipwho.is/{ip}")  # free, no key, HTTPS
 GEO_CACHE = {}  # ip -> (expires_at, result)
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Asia/Amman"))
-SELF_OPEN_GRACE_SECONDS = 10  # requests this soon after sending are assumed to be you
+EARLY_OPEN_SECONDS = int(os.environ.get("EARLY_OPEN_SECONDS", "60"))  # faster than this = scanner, not a person
+SELF_VIEW_WINDOW = 20  # seconds around your own view of a sent message that are treated as you
 
 STARTED = time.time()
 PING = {"ts": 0.0, "ua": ""}  # last keep-alive ping seen on /health
 
 # Security scanners / bots that pre-fetch images. Gmail's and Yahoo's image proxies are
 # deliberately NOT listed: they only fetch the image when the message is opened.
-PROXY_MARKERS = ("proofpoint", "mimecast", "barracuda", "bot", "scanner", "preview")
+PROXY_MARKERS = ("proofpoint", "mimecast", "barracuda", "bot", "scanner", "preview", "whatsapp",
+                 "facebookexternalhit", "slurp", "crawler", "spider")
+HTTP_CLIENT_MARKERS = ("python", "curl/", "wget", "go-http-client", "java/", "apache-httpclient", "axios",
+                       "node-fetch", "libwww", "headlesschrome", "phantomjs", "lighthouse", "aiohttp")
+SECURITY_NETWORKS = ("proofpoint", "mimecast", "barracuda", "cisco", "ironport", "symantec", "broadcom",
+                     "trend micro", "trendmicro", "sophos", "trellix", "fireeye", "forcepoint", "zscaler",
+                     "mcafee", "messagelabs", "fortinet", "sonicwall", "cloudmark", "vade", "hornetsecurity",
+                     "retarus", "kaspersky", "avanan", "darktrace", "ironscales", "egress")
+HOSTING_NETWORKS = ("amazon", "digitalocean", "ovh", "hetzner", "linode", "vultr", "choopa", "leaseweb",
+                    "oracle", "alibaba", "scaleway", "contabo", "m247")
 
 GIF = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
 
@@ -169,11 +179,12 @@ def init_db():
         idcol = "BIGSERIAL PRIMARY KEY" if c.pg else "INTEGER PRIMARY KEY AUTOINCREMENT"
         c.execute("""CREATE TABLE IF NOT EXISTS emails(
             id TEXT PRIMARY KEY, recipient TEXT, subject TEXT,
-            created_at DOUBLE PRECISION, sent_at DOUBLE PRECISION, pixel_present INTEGER)""")
+            created_at DOUBLE PRECISION, sent_at DOUBLE PRECISION, pixel_present INTEGER,
+            self_view_at DOUBLE PRECISION)""")
         c.execute(f"""CREATE TABLE IF NOT EXISTS opens(
             id {idcol}, email_id TEXT, opened_at DOUBLE PRECISION,
             ip TEXT, user_agent TEXT, automated INTEGER,
-            country TEXT, country_code TEXT, region TEXT, city TEXT, isp TEXT)""")
+            country TEXT, country_code TEXT, region TEXT, city TEXT, isp TEXT, reason TEXT)""")
         c.execute(f"""CREATE TABLE IF NOT EXISTS hits(
             id {idcol}, ts DOUBLE PRECISION, email_id TEXT, ip TEXT, user_agent TEXT, result TEXT)""")
         c.execute("CREATE INDEX IF NOT EXISTS opens_email ON opens(email_id)")
@@ -181,7 +192,8 @@ def init_db():
         # Upgrade databases created by older versions.
         for table, col, typ in (("emails", "sent_at", "DOUBLE PRECISION"), ("emails", "pixel_present", "INTEGER"),
                                 ("opens", "country", "TEXT"), ("opens", "country_code", "TEXT"),
-                                ("opens", "region", "TEXT"), ("opens", "city", "TEXT"), ("opens", "isp", "TEXT")):
+                                ("opens", "region", "TEXT"), ("opens", "city", "TEXT"), ("opens", "isp", "TEXT"),
+                                ("opens", "reason", "TEXT"), ("emails", "self_view_at", "DOUBLE PRECISION")):
             if c.pg:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {typ}")
             else:
@@ -209,6 +221,42 @@ def ago(ts):
     if s < 172800:
         return f"{s // 3600} h ago"
     return f"{s // 86400} days ago"
+
+
+def classify_open(ua, isp, delay):
+    """Decide whether a load of the tracking image was probably a PERSON reading the email.
+    Returns None when it looks human, otherwise a short plain-language reason."""
+    u = (ua or "").lower().strip()
+    name = parse_client(ua)[0]
+    isp_l = (isp or "").lower()
+    if not u:
+        return "no browser identity (automatic fetch)"
+    if any(m in u for m in PROXY_MARKERS):
+        return "bot or link-preview fetch"
+    if any(m in u for m in HTTP_CLIENT_MARKERS):
+        return "automatic program, not a mail app"
+    if any(w in isp_l for w in SECURITY_NETWORKS):
+        return f"company security scanner ({isp})"
+    if name not in ("Gmail", "Yahoo Mail") and any(w in isp_l for w in HOSTING_NETWORKS):
+        return f"server in a data center ({isp}), not a person"
+    if name == "Apple Mail":
+        return "Apple Mail pre-loads images, so this does not prove it was read"
+    if delay is not None and delay < EARLY_OPEN_SECONDS:
+        return f"arrived {int(max(delay, 0))}s after sending: too fast, servers pre-load on delivery"
+    return None
+
+
+def delay_text(seconds):
+    if seconds is None:
+        return ""
+    seconds = int(max(seconds, 0))
+    if seconds < 90:
+        return f"{seconds}s after sending"
+    if seconds < 5400:
+        return f"{seconds // 60} min after sending"
+    if seconds < 172800:
+        return f"{seconds // 3600} h after sending"
+    return f"{seconds // 86400} days after sending"
 
 
 def status_from(rows):
@@ -408,8 +456,9 @@ def page_dashboard():
 <table><tr><th><input type=checkbox title="Select all" onclick="document.querySelectorAll('input[name=id]').forEach(b=>b.checked=this.checked)"></th>
 <th>Subject</th><th>To</th><th>Status</th><th>Opens</th><th>Opened with</th><th>Location</th><th>First opened</th><th>Last opened</th></tr>
 {rows or '<tr><td colspan=9>No tracked emails yet.</td></tr>'}</table></form>
-<p><small>OPENED? = only automated/scanner loads seen, so a human read is not confirmed.
-Opens in the first {SELF_OPEN_GRACE_SECONDS}s after sending are assumed to be you.
+<p><small><b>READ</b> = at least one load that looks like a real person.
+<b>OPENED?</b> = the image was loaded, but only in ways that can be automatic (security scanners, Apple Mail pre-loading,
+loads within {EARLY_OPEN_SECONDS}s of sending, your own view). Open the email to see the reason for each load.
 <a href="/ignore-me">Ignore my own opens in this browser</a></small></p>
 <details class=card><summary>Track an email by hand (without the Gmail extension)</summary>
 <form method=post action=/create><input name=recipient placeholder="Recipient email" required>
@@ -424,10 +473,12 @@ def page_email(email_id, base):
         opens = c.execute("SELECT * FROM opens WHERE email_id=? ORDER BY opened_at DESC", (email_id,)).fetchall()
         hits = c.execute("SELECT * FROM hits WHERE email_id=? ORDER BY ts DESC LIMIT 50", (email_id,)).fetchall()
     s, n, first, last = status_from(list(reversed(opens)))
+    ref = e["sent_at"] or e["created_at"] or 0
     url = f"{base}/t/{email_id}.gif"
     snippet = f'<img src="{url}" width="1" height="1" alt="" style="display:none">'
     log = "".join(
-        f'<tr><td>{fmt(o["opened_at"])}</td><td>{"automated/scanner" if o["automated"] else "likely human"}</td>'
+        f'<tr><td>{fmt(o["opened_at"])}<br><small>{delay_text(o["opened_at"] - ref)}</small></td>'
+        f'<td>{("<span class=ok>looks like a person</span>" if not o["automated"] else "<span class=warn>automatic?</span><br><small>" + html.escape(o["reason"] or "flagged as automatic") + "</small>")}</td>'
         f'<td>{client_label(o["user_agent"])}</td><td>{location_label(o)}</td></tr>' for o in opens)
     raw = "".join(
         f'<tr><td>{fmt(h["ts"])}</td><td>{html.escape(h["result"])}</td><td>{client_label(h["user_agent"])}'
@@ -440,7 +491,7 @@ def page_email(email_id, base):
 <input type=hidden name=id value="{html.escape(email_id)}"><button class=danger>🗑 Delete this email</button></form>
 <h3>{html.escape(e["subject"] or "(no subject)")}</h3>
 <p>To: {html.escape(e["recipient"] or "")} &nbsp; {badge(s)} &nbsp; Opens: {n}</p>{warn}
-<table><tr><th>Time</th><th>Type</th><th>Opened with</th><th>Location / IP</th></tr>
+<table><tr><th>Time</th><th>Verdict</th><th>Opened with</th><th>Location / IP</th></tr>
 {log or '<tr><td colspan=4>No opens yet.</td></tr>'}</table>
 <h4>Every request the server received for this email's pixel</h4>
 <table><tr><th>Time</th><th>What happened</th><th>From</th></tr>
@@ -582,6 +633,20 @@ class Handler(BaseHTTPRequestHandler):
                     c.execute(f"DELETE FROM emails WHERE id IN ({q})", ids)
             return self.send(303, "", headers={"Location": "/"})
 
+        if path == "/api/selfview":  # extension: you are looking at your own sent message
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                return self.send_json({"error": "bad json"}, 400)
+            eid = str(data.get("id", ""))[:60]
+            with db() as c:
+                c.execute("UPDATE emails SET self_view_at=? WHERE id=?", (now, eid))
+                c.execute("""UPDATE opens SET automated=1, reason=?
+                             WHERE email_id=? AND opened_at BETWEEN ? AND ? AND automated=0""",
+                          ("you were viewing your own sent message at that moment", eid,
+                           now - SELF_VIEW_WINDOW, now + SELF_VIEW_WINDOW))
+            return self.send_json({"ok": True})
+
         if path == "/api/new":  # extension: compose window opened -> hand out a pixel
             eid = secrets.token_urlsafe(12)
             with db() as c:
@@ -614,22 +679,24 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with db() as c:
                 now = time.time()
-                e = c.execute("SELECT COALESCE(sent_at, created_at) AS ref FROM emails WHERE id=?",
-                              (email_id,)).fetchone()
+                e = c.execute("""SELECT COALESCE(sent_at, created_at) AS ref, self_view_at FROM emails
+                                 WHERE id=?""", (email_id,)).fetchone()
                 if not e:
                     result = "ignored: unknown id (data was lost in a restart, or wrong link)"
                 elif is_me:
                     result = "ignored: from your own browser"
-                elif now - e["ref"] <= SELF_OPEN_GRACE_SECONDS:
-                    result = f"ignored: within {SELF_OPEN_GRACE_SECONDS}s of sending (assumed you)"
                 else:
-                    result = "counted as an open"
-                    automated = int(any(m in ua.lower() for m in PROXY_MARKERS))
                     g = geolocate(ip) or {}
+                    delay = now - e["ref"]
+                    reason = classify_open(ua, g.get("isp"), delay)
+                    if (reason is None and e["self_view_at"]
+                            and abs(now - e["self_view_at"]) <= SELF_VIEW_WINDOW):
+                        reason = "you were viewing your own sent message at that moment"
+                    result = "counted as an open" + (f" (flagged automatic: {reason})" if reason else " (looks like a person)")
                     c.execute("""INSERT INTO opens(email_id,opened_at,ip,user_agent,automated,
-                                 country,country_code,region,city,isp) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                              (email_id, now, ip, ua[:300], automated, g.get("country"), g.get("country_code"),
-                               g.get("region"), g.get("city"), g.get("isp")))
+                                 country,country_code,region,city,isp,reason) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                              (email_id, now, ip, ua[:300], int(reason is not None), g.get("country"),
+                               g.get("country_code"), g.get("region"), g.get("city"), g.get("isp"), reason))
                 c.execute("INSERT INTO hits(ts,email_id,ip,user_agent,result) VALUES(?,?,?,?,?)",
                           (now, email_id, ip, ua[:300], result))
                 c.execute("DELETE FROM hits WHERE id < (SELECT MAX(id) FROM hits) - 500")
