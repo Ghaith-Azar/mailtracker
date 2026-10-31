@@ -32,7 +32,7 @@ import urllib.request
 from datetime import datetime
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 from zoneinfo import ZoneInfo
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme")
@@ -48,11 +48,14 @@ TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
 GEO_URL = os.environ.get("GEO_URL", "https://ipwho.is/{ip}")  # free, no key, HTTPS
 GEO_CACHE = {}  # ip -> (expires_at, result)
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Asia/Amman"))
-EARLY_OPEN_SECONDS = int(os.environ.get("EARLY_OPEN_SECONDS", "60"))  # faster than this = scanner, not a person
+EARLY_OPEN_SECONDS = int(os.environ.get("EARLY_OPEN_SECONDS", "35"))  # faster than this = scanner, not a person
 SELF_VIEW_WINDOW = 20  # seconds around your own view of a sent message that are treated as you
 
 STARTED = time.time()
-PING = {"ts": 0.0, "ua": ""}  # last keep-alive ping seen on /health
+PING = {"ts": 0.0, "ua": "", "path": "", "method": ""}  # last keep-alive ping from an uptime monitor
+HEALTH_PATHS = ("/health", "/healthz", "/ping", "/status")
+MONITOR_UAS = ("uptimerobot", "pingdom", "statuscake", "cron-job.org", "betteruptime", "better stack",
+               "freshping", "hetrixtools", "site24x7", "uptime-kuma", "updown.io", "nodeping", "checkly")
 
 # Security scanners / bots that pre-fetch images. Gmail's and Yahoo's image proxies are
 # deliberately NOT listed: they only fetch the image when the message is opened.
@@ -180,7 +183,7 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS emails(
             id TEXT PRIMARY KEY, recipient TEXT, subject TEXT,
             created_at DOUBLE PRECISION, sent_at DOUBLE PRECISION, pixel_present INTEGER,
-            self_view_at DOUBLE PRECISION)""")
+            self_view_at DOUBLE PRECISION, sender TEXT)""")
         c.execute(f"""CREATE TABLE IF NOT EXISTS opens(
             id {idcol}, email_id TEXT, opened_at DOUBLE PRECISION,
             ip TEXT, user_agent TEXT, automated INTEGER,
@@ -193,7 +196,8 @@ def init_db():
         for table, col, typ in (("emails", "sent_at", "DOUBLE PRECISION"), ("emails", "pixel_present", "INTEGER"),
                                 ("opens", "country", "TEXT"), ("opens", "country_code", "TEXT"),
                                 ("opens", "region", "TEXT"), ("opens", "city", "TEXT"), ("opens", "isp", "TEXT"),
-                                ("opens", "reason", "TEXT"), ("emails", "self_view_at", "DOUBLE PRECISION")):
+                                ("opens", "reason", "TEXT"), ("emails", "self_view_at", "DOUBLE PRECISION"),
+                                ("emails", "sender", "TEXT")):
             if c.pg:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {typ}")
             else:
@@ -398,23 +402,36 @@ def badge(s):
     return f'<span class="badge {cls}">{html.escape(s)}</span>'
 
 
-def health_panel(c):
+def health_panel(c, base):
     lines = []
     if c.persistent:
         lines.append('<span class=ok>✅ Storage: permanent database. History survives restarts.</span>')
     else:
         lines.append('<span class=warn>⚠ Storage: temporary file. On free Render all history is wiped when the '
                      'server restarts or sleeps. Connect a free Turso or Neon database to fix this.</span>')
-    external = PING["ts"] and "render" not in PING["ua"].lower()
-    if external and time.time() - PING["ts"] < 600:
-        lines.append(f'<span class=ok>✅ Keep-alive: last ping {ago(PING["ts"])} '
-                     f'({html.escape(PING["ua"][:40])}).</span>')
+    url = f"{base}/health"
+    up_for = time.time() - STARTED
+    if PING["ts"] and time.time() - PING["ts"] < 660:
+        extra = ""
+        if PING["path"].rstrip("/") not in HEALTH_PATHS:
+            extra = (f' It is pinging <b>{html.escape(PING["path"])}</b>, which works, but the recommended '
+                     f'address is <b>{html.escape(url)}</b>.')
+        known = next((m for m in MONITOR_UAS if m in PING["ua"].lower()), None)
+        who = {"uptimerobot": "UptimeRobot"}.get(known, known.title() if known else PING["ua"][:45])
+        lines.append(f'<span class=ok>✅ Keep-alive working: last ping {ago(PING["ts"])} '
+                     f'({html.escape(PING["method"])} {html.escape(PING["path"])} from '
+                     f'{html.escape(who)}).</span>{extra}')
     elif PING["ts"]:
-        lines.append(f'<span class=warn>⚠ Keep-alive: last ping {ago(PING["ts"])}. '
-                     'Your monitor should ping every 5 minutes.</span>')
+        lines.append(f'<span class=warn>⚠ Keep-alive: the last ping was {ago(PING["ts"])}. Your monitor is paused, '
+                     'or its interval is longer than 10 minutes. Set it to 5 minutes and make sure it is not paused.</span>')
+    elif up_for < 330:
+        lines.append(f'<span class=warn>⏳ Keep-alive: waiting for the first ping. The server started {ago(STARTED)} and the '
+                     'monitor checks every 5 minutes, so reload this page in a few minutes.</span>')
     else:
-        lines.append('<span class=warn>⚠ Keep-alive: no ping seen since the server started '
-                     f'({ago(STARTED)}). Check the UptimeRobot monitor URL ends with /health.</span>')
+        lines.append(f'<span class=warn>⚠ Keep-alive: no ping received since the server started ({ago(STARTED)}). '
+                     f'In UptimeRobot check: type <b>HTTP(s)</b>, URL exactly <b>{html.escape(url)}</b>, interval '
+                     '<b>5 minutes</b>, and that the monitor is not paused. '
+                     f'Test: open <a href="/health">{html.escape(url)}</a> in your browser, it should show "ok".</span>')
     lines.append(f'<small>Server started {fmt(STARTED)} ({ago(STARTED)}). '
                  f'<a href="/debug">Show every pixel request received</a></small>')
     return '<div class=card>' + "<br>".join(lines) + "</div>"
@@ -425,21 +442,39 @@ CONFIRM_JS = ("var n=document.querySelectorAll('input[name=id]:checked').length;
               "return confirm('Permanently delete '+n+' email(s) and their open history?')")
 
 
-def page_dashboard():
+VISIBLE = "(sent_at IS NOT NULL)"  # emails still being written (not sent) are never listed
+
+
+def page_dashboard(base, sender_filter=None):
     with db() as c:
-        emails = c.execute("""SELECT * FROM emails
-                              WHERE sent_at IS NOT NULL OR id IN (SELECT email_id FROM opens)
-                              ORDER BY COALESCE(sent_at, created_at) DESC LIMIT 200""").fetchall()
+        where, params = VISIBLE, []
+        if sender_filter == "__none__":
+            where += " AND (sender IS NULL OR sender = '')"
+        elif sender_filter:
+            where += " AND sender = ?"
+            params.append(sender_filter.strip().lower())
+        emails = c.execute(f"""SELECT * FROM emails WHERE {where}
+                               ORDER BY COALESCE(sent_at, created_at) DESC LIMIT 200""", params).fetchall()
+        accounts = c.execute(f"""SELECT COALESCE(sender, '') AS s, COUNT(*) AS n FROM emails
+                                 WHERE {VISIBLE} GROUP BY COALESCE(sender, '') ORDER BY n DESC""").fetchall()
         by_email = {}
         if emails:
             ids = [e["id"] for e in emails]
             q = ",".join("?" * len(ids))
             for o in c.execute(f"SELECT * FROM opens WHERE email_id IN ({q}) ORDER BY opened_at", ids):
                 by_email.setdefault(o["email_id"], []).append(o)
-        panel = health_panel(c)
+        panel = health_panel(c, base)
+    total = sum(a["n"] for a in accounts)
+    chips = [f'<a href="/">{"<b>All</b>" if not sender_filter else "All"} ({total})</a>']
+    for a in accounts:
+        token = a["s"] or "__none__"
+        label = html.escape(a["s"] or "(sender not recorded)")
+        shown = f"<b>{label}</b>" if sender_filter and (sender_filter == token or sender_filter.lower() == a["s"]) else label
+        chips.append(f'<a href="/?from={quote(token)}">{shown} ({a["n"]})</a>')
+    account_bar = '<p class=card><small>Sent from:</small> ' + " &nbsp;·&nbsp; ".join(chips) + "</p>"
     rows = ""
     for e in emails:
-        opens = by_email.get(e["id"], [])
+        opens = [o for o in by_email.get(e["id"], []) if not e["sent_at"] or o["opened_at"] >= e["sent_at"]]
         s, n, first, last = status_from(opens)
         pick = ([o for o in reversed(opens) if not o["automated"]] or list(reversed(opens)) or [None])[0]
         via = client_label(pick["user_agent"]) if pick else "—"
@@ -447,15 +482,16 @@ def page_dashboard():
         warn = "<br><small class=bad>⚠ tracking pixel was missing when sent</small>" if e["pixel_present"] == 0 else ""
         rows += (f'<tr><td><input type=checkbox name=id value="{e["id"]}"></td>'
                  f'<td><a href="/email/{e["id"]}">{html.escape(e["subject"] or "(no subject)")}</a>{warn}</td>'
+                 f'<td><small>{html.escape(e["sender"] or "—")}</small></td>'
                  f'<td>{html.escape(e["recipient"] or "")}</td><td>{badge(s)}</td>'
                  f'<td>{n}</td><td>{via}</td><td>{where}</td><td>{fmt(first)}</td><td>{fmt(last)}</td></tr>')
     return f"""<!doctype html><title>MailTracker</title>{STYLE}
-<h2>📬 MailTracker</h2>{panel}
+<h2>📬 MailTracker</h2>{panel}{account_bar}
 <form method=post action=/delete onsubmit="{CONFIRM_JS}">
 <p><button class=danger>🗑 Delete selected</button> <small>Tick the boxes (top box selects all).</small></p>
 <table><tr><th><input type=checkbox title="Select all" onclick="document.querySelectorAll('input[name=id]').forEach(b=>b.checked=this.checked)"></th>
-<th>Subject</th><th>To</th><th>Status</th><th>Opens</th><th>Opened with</th><th>Location</th><th>First opened</th><th>Last opened</th></tr>
-{rows or '<tr><td colspan=9>No tracked emails yet.</td></tr>'}</table></form>
+<th>Subject</th><th>From (your account)</th><th>To</th><th>Status</th><th>Opens</th><th>Opened with</th><th>Location</th><th>First opened</th><th>Last opened</th></tr>
+{rows or '<tr><td colspan=10>No tracked emails yet.</td></tr>'}</table></form>
 <p><small><b>READ</b> = at least one load that looks like a real person.
 <b>OPENED?</b> = the image was loaded, but only in ways that can be automatic (security scanners, Apple Mail pre-loading,
 loads within {EARLY_OPEN_SECONDS}s of sending, your own view). Open the email to see the reason for each load.
@@ -471,6 +507,8 @@ def page_email(email_id, base):
         if not e:
             return None
         opens = c.execute("SELECT * FROM opens WHERE email_id=? ORDER BY opened_at DESC", (email_id,)).fetchall()
+        if e["sent_at"]:  # loads before the send moment were you writing the email, not a reader
+            opens = [o for o in opens if o["opened_at"] >= e["sent_at"]]
         hits = c.execute("SELECT * FROM hits WHERE email_id=? ORDER BY ts DESC LIMIT 50", (email_id,)).fetchall()
     s, n, first, last = status_from(list(reversed(opens)))
     ref = e["sent_at"] or e["created_at"] or 0
@@ -490,7 +528,7 @@ def page_email(email_id, base):
 <form method=post action=/delete style="float:right" onsubmit="return confirm('Permanently delete this email and its open history?')">
 <input type=hidden name=id value="{html.escape(email_id)}"><button class=danger>🗑 Delete this email</button></form>
 <h3>{html.escape(e["subject"] or "(no subject)")}</h3>
-<p>To: {html.escape(e["recipient"] or "")} &nbsp; {badge(s)} &nbsp; Opens: {n}</p>{warn}
+<p>From: <b>{html.escape(e["sender"] or "not recorded")}</b> &nbsp; To: {html.escape(e["recipient"] or "")} &nbsp; {badge(s)} &nbsp; Opens: {n}</p>{warn}
 <table><tr><th>Time</th><th>Verdict</th><th>Opened with</th><th>Location / IP</th></tr>
 {log or '<tr><td colspan=4>No opens yet.</td></tr>'}</table>
 <h4>Every request the server received for this email's pixel</h4>
@@ -500,10 +538,10 @@ def page_email(email_id, base):
 <textarea rows=2 readonly onclick="this.select()">{html.escape(snippet)}</textarea></div>"""
 
 
-def page_debug():
+def page_debug(base):
     with db() as c:
         hits = c.execute("SELECT * FROM hits ORDER BY ts DESC LIMIT 60").fetchall()
-        panel = health_panel(c)
+        panel = health_panel(c, base)
     rows = "".join(
         f'<tr><td>{fmt(h["ts"])}</td><td><small>{html.escape(h["email_id"] or "")}</small></td>'
         f'<td>{html.escape(h["result"])}</td><td>{client_label(h["user_agent"])}</td></tr>' for h in hits)
@@ -561,14 +599,23 @@ class Handler(BaseHTTPRequestHandler):
         xff = self.headers.get("X-Forwarded-For")
         return xff.split(",")[0].strip() if xff else self.client_address[0]
 
-    def note_ping(self):
-        PING["ts"] = time.time()
-        PING["ua"] = self.headers.get("User-Agent", "")
+    def is_monitor_request(self, path):
+        """A keep-alive ping: the /health address, or any address requested by a known monitoring service
+        (so a monitor pointed at the wrong page still keeps the server awake and gets a friendly 'ok')."""
+        ua = self.headers.get("User-Agent", "").lower()
+        p = path.rstrip("/") or "/"
+        return p in HEALTH_PATHS or (any(m in ua for m in MONITOR_UAS) and not p.startswith("/t/"))
+
+    def note_ping(self, path, method):
+        ua = self.headers.get("User-Agent", "")
+        if "render" in ua.lower():  # Render's own health checks do not keep a free service awake
+            return
+        PING.update(ts=time.time(), ua=ua, path=path[:80], method=method)
 
     def do_HEAD(self):
         path = urlparse(self.path).path
-        if path == "/health":
-            self.note_ping()
+        if self.is_monitor_request(path):
+            self.note_ping(path, "HEAD")
             self.send_response(200)
         else:
             self.send_response(404)
@@ -576,9 +623,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        path = urlparse(self.path).path
-        if path == "/health":  # public: uptime monitors / Render health check
-            self.note_ping()
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if self.is_monitor_request(path):  # public: uptime monitors
+            self.note_ping(path, "GET")
             return self.send(200, "ok", "text/plain")
         if path.startswith("/t/") and path.endswith(".gif"):
             return self.pixel(path[3:-4][:60])
@@ -587,9 +635,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/ping":
             return self.send_json({"ok": True})
         if path == "/":
-            return self.send(200, page_dashboard())
+            who = parse_qs(parsed.query).get("from", [None])[0]
+            return self.send(200, page_dashboard(self.base_url(), who))
         if path == "/debug":
-            return self.send(200, page_debug())
+            return self.send(200, page_debug(self.base_url()))
         if path.startswith("/email/"):
             body = page_email(path.split("/")[2], self.base_url())
             return self.send(200, body) if body else self.send(404, "Not found")
@@ -661,10 +710,10 @@ class Handler(BaseHTTPRequestHandler):
             present = data.get("pixel_present")
             present = None if present is None else int(bool(present))
             with db() as c:
-                c.execute("""UPDATE emails SET recipient=?, subject=?, sent_at=?, pixel_present=?
+                c.execute("""UPDATE emails SET recipient=?, subject=?, sent_at=?, pixel_present=?, sender=?
                              WHERE id=? AND sent_at IS NULL""", (
                     str(data.get("recipient", ""))[:200], str(data.get("subject", ""))[:300], now, present,
-                    str(data.get("id", ""))))
+                    str(data.get("sender", "")).strip().lower()[:200], str(data.get("id", ""))))
             return self.send_json({"ok": True})
 
         self.send(404, "Not found")
@@ -679,9 +728,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with db() as c:
                 now = time.time()
-                e = c.execute("""SELECT COALESCE(sent_at, created_at) AS ref, self_view_at FROM emails
+                e = c.execute("""SELECT COALESCE(sent_at, created_at) AS ref, sent_at, self_view_at FROM emails
                                  WHERE id=?""", (email_id,)).fetchone()
-                if not e:
+                if e and e["sent_at"] is None:
+                    result = "ignored: email not sent yet (you are writing it, or the draft is open)"
+                elif not e:
                     result = "ignored: unknown id (data was lost in a restart, or wrong link)"
                 elif is_me:
                     result = "ignored: from your own browser"
